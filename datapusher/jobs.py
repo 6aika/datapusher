@@ -13,8 +13,8 @@ import pprint
 import logging
 import decimal
 import hashlib
-import cStringIO
 import time
+import tempfile
 
 import messytables
 from slugify import slugify
@@ -23,11 +23,23 @@ import ckanserviceprovider.job as job
 import ckanserviceprovider.util as util
 from ckanserviceprovider import web
 
-if not locale.getlocale()[0]:
+if locale.getdefaultlocale()[0]:
+    lang, encoding = locale.getdefaultlocale()
+    locale.setlocale(locale.LC_ALL, locale=(lang, encoding))
+else:
     locale.setlocale(locale.LC_ALL, '')
 
 MAX_CONTENT_LENGTH = web.app.config.get('MAX_CONTENT_LENGTH') or 10485760
+CHUNK_SIZE = 16 * 1024 # 16kb
 DOWNLOAD_TIMEOUT = 30
+
+if web.app.config.get('SSL_VERIFY') in ['False', 'FALSE', '0']:
+    SSL_VERIFY = False
+else:
+    SSL_VERIFY = True
+
+if not SSL_VERIFY:
+    requests.packages.urllib3.disable_warnings()
 
 _TYPE_MAPPING = {
     'String': 'text',
@@ -94,6 +106,11 @@ class HTTPError(util.JobError):
             "Requested URL": self.request_url,
             "Response": response,
         }
+
+    def __str__(self):
+        return u'{} status={} url={} response={}'.format(
+            self.message, self.status_code, self.request_url, self.response) \
+            .encode('ascii', 'replace')
 
 
 def get_url(action, ckan_url):
@@ -173,6 +190,7 @@ def delete_datastore_resource(resource_id, api_key, ckan_url):
     try:
         delete_url = get_url('datastore_delete', ckan_url)
         response = requests.post(delete_url,
+                                 verify=SSL_VERIFY,
                                  data=json.dumps({'id': resource_id,
                                                   'force': True}),
                                  headers={'Content-Type': 'application/json',
@@ -188,6 +206,7 @@ def datastore_resource_exists(resource_id, api_key, ckan_url):
     try:
         search_url = get_url('datastore_search', ckan_url)
         response = requests.post(search_url,
+                                 verify=SSL_VERIFY,
                                  params={'id': resource_id,
                                          'limit': 0},
                                  headers={'Content-Type': 'application/json',
@@ -196,11 +215,15 @@ def datastore_resource_exists(resource_id, api_key, ckan_url):
         if response.status_code == 404:
             return False
         elif response.status_code == 200:
-            return True
+            return response.json().get('result', {'fields': []})
         else:
-            raise util.JobError('Error getting datastore resource.')
-    except requests.exceptions.RequestException:
-        raise util.JobError('Error getting datastore resource.')
+            raise HTTPError(
+                'Error getting datastore resource.',
+                response.status_code, search_url, response,
+            )
+    except requests.exceptions.RequestException as e:
+        raise util.JobError(
+            'Error getting datastore resource ({!s}).'.format(e))
 
 
 def send_resource_to_datastore(resource, headers, records, api_key, ckan_url):
@@ -215,9 +238,10 @@ def send_resource_to_datastore(resource, headers, records, api_key, ckan_url):
     name = resource.get('name')
     url = get_url('datastore_create', ckan_url)
     r = requests.post(url,
+                      verify=SSL_VERIFY,
                       data=json.dumps(request, cls=DatastoreEncoder),
                       headers={'Content-Type': 'application/json',
-                               'Authorization': api_key},
+                               'Authorization': api_key}
                       )
     check_response(r, url, 'CKAN DataStore')
 
@@ -232,9 +256,11 @@ def update_resource(resource, api_key, ckan_url):
     url = get_url('resource_update', ckan_url)
     r = requests.post(
         url,
+        verify=SSL_VERIFY,
         data=json.dumps(resource),
         headers={'Content-Type': 'application/json',
-                 'Authorization': api_key})
+                 'Authorization': api_key}
+    )
 
     check_response(r, url, 'CKAN')
 
@@ -245,6 +271,7 @@ def get_resource(resource_id, ckan_url, api_key):
     """
     url = get_url('resource_show', ckan_url)
     r = requests.post(url,
+                      verify=SSL_VERIFY,
                       data=json.dumps({'id': resource_id}),
                       headers={'Content-Type': 'application/json',
                                'Authorization': api_key}
@@ -302,11 +329,21 @@ def push_to_datastore(task_id, input, dry_run=False):
         #try again in 5 seconds just incase CKAN is slow at adding resource
         time.sleep(5)
         resource = get_resource(resource_id, ckan_url, api_key)
+        
+    # check if the resource url_type is a datastore
+    if resource.get('url_type') == 'datastore':
+        logger.info('Dump files are managed with the Datastore API')
+        return
 
     # fetch the resource data
     logger.info('Fetching from: {0}'.format(resource.get('url')))
     try:
         request = urllib2.Request(resource.get('url'))
+        
+        if request.get_type().lower() not in ('http', 'https', 'ftp'):
+            raise util.JobError(
+                'Only http, https, and ftp resources may be fetched.'
+            )
 
         # Removed authentication as we authenticate requests in cloudstorage extension
         #if resource.get('url_type') == 'upload':
@@ -335,11 +372,25 @@ def push_to_datastore(task_id, input, dry_run=False):
             'Resource too large to download: {cl} > max ({max_cl}).'.format(
             cl=cl, max_cl=MAX_CONTENT_LENGTH))
 
+    tmp = tempfile.TemporaryFile()
+    length = 0
+    m = hashlib.md5()
+    while True:
+        chunk = response.read(CHUNK_SIZE)
+        if not chunk:
+            break
+        length += len(chunk) 
+        if length > MAX_CONTENT_LENGTH:
+            raise util.JobError(
+                'Resource too large to process: {cl} > max ({max_cl}).'.format(
+                cl=length, max_cl=MAX_CONTENT_LENGTH))
+        tmp.write(chunk)
+        m.update(chunk)
+
     ct = response.info().getheader('content-type').split(';', 1)[0]
 
-    f = cStringIO.StringIO(response.read())
-    file_hash = hashlib.md5(f.read()).hexdigest()
-    f.seek(0)
+    file_hash = m.hexdigest()
+    tmp.seek(0)
 
     if (resource.get('hash') == file_hash
             and not data.get('ignore_hash')):
@@ -350,18 +401,24 @@ def push_to_datastore(task_id, input, dry_run=False):
     resource['hash'] = file_hash
 
     try:
-        table_set = messytables.any_tableset(f, mimetype=ct, extension=ct)
+        table_set = messytables.any_tableset(tmp, mimetype=ct, extension=ct)
     except messytables.ReadError as e:
         ## try again with format
-        f.seek(0)
+        tmp.seek(0)
         try:
             format = resource.get('format')
-            table_set = messytables.any_tableset(f, mimetype=format, extension=format)
+            table_set = messytables.any_tableset(tmp, mimetype=format, extension=format)
         except:
             raise util.JobError(e)
 
     row_set = table_set.tables.pop()
     offset, headers = messytables.headers_guess(row_set.sample)
+
+    existing = datastore_resource_exists(resource_id, api_key, ckan_url)
+    existing_info = None
+    if existing:
+        existing_info = dict((f['id'], f['info'])
+            for f in existing.get('fields', []) if 'info' in f)
 
     # Some headers might have been converted from strings to floats and such.
     headers = [unicode(header) for header in headers]
@@ -369,6 +426,16 @@ def push_to_datastore(task_id, input, dry_run=False):
     row_set.register_processor(messytables.headers_processor(headers))
     row_set.register_processor(messytables.offset_processor(offset + 1))
     types = messytables.type_guess(row_set.sample, types=TYPES, strict=True)
+
+    # override with types user requested
+    if existing_info:
+        types = [{
+            'text': messytables.StringType(),
+            'numeric': messytables.DecimalType(),
+            'timestamp': messytables.DateUtilType(),
+            }.get(existing_info.get(h, {}).get('type_override'), t)
+            for t, h in zip(types, headers)]
+
     row_set.register_processor(messytables.types_processor(types))
 
     headers = [header.strip() for header in headers if header.strip()]
@@ -390,13 +457,23 @@ def push_to_datastore(task_id, input, dry_run=False):
     'datastore_create' will append to the existing datastore. And if
     the fields have significantly changed, it may also fail.
     '''
-    if datastore_resource_exists(resource_id, api_key, ckan_url):
+    if existing:
         logger.info('Deleting "{res_id}" from datastore.'.format(
             res_id=resource_id))
         delete_datastore_resource(resource_id, api_key, ckan_url)
 
     headers_dicts = [dict(id=field[0], type=TYPE_MAPPING[str(field[1])])
                      for field in zip(headers, types)]
+
+    # Maintain data dictionaries from matching column names
+    if existing_info:
+        for h in headers_dicts:
+            if h['id'] in existing_info:
+                h['info'] = existing_info[h['id']]
+                # create columns with types user requested
+                type_override = existing_info[h['id']].get('type_override')
+                if type_override in _TYPE_MAPPING.values():
+                    h['type'] = type_override
 
     logger.info('Determined headers and types: {headers}'.format(
         headers=headers_dicts))
