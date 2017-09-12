@@ -40,6 +40,8 @@ else:
 
 if not SSL_VERIFY:
     requests.packages.urllib3.disable_warnings()
+    import ssl
+    ssl._create_default_https_context = ssl._create_unverified_context
 
 _TYPE_MAPPING = {
     'String': 'text',
@@ -339,7 +341,7 @@ def push_to_datastore(task_id, input, dry_run=False):
     logger.info('Fetching from: {0}'.format(resource.get('url')))
     try:
         request = urllib2.Request(resource.get('url'))
-        
+
         if request.get_type().lower() not in ('http', 'https', 'ftp'):
             raise util.JobError(
                 'Only http, https, and ftp resources may be fetched.'
