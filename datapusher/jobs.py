@@ -2,7 +2,6 @@
 from __future__ import unicode_literals
 
 import json
-import urllib2
 import socket
 import requests
 import urlparse
@@ -33,7 +32,7 @@ MAX_CONTENT_LENGTH = web.app.config.get('MAX_CONTENT_LENGTH') or 10485760
 CHUNK_SIZE = 16 * 1024 # 16kb
 DOWNLOAD_TIMEOUT = 30
 
-if web.app.config.get('SSL_VERIFY') in ['False', 'FALSE', '0']:
+if web.app.config.get('SSL_VERIFY') in ['False', 'FALSE', '0', False, 0]:
     SSL_VERIFY = False
 else:
     SSL_VERIFY = True
@@ -337,59 +336,62 @@ def push_to_datastore(task_id, input, dry_run=False):
         logger.info('Dump files are managed with the Datastore API')
         return
 
+    # check scheme
+    url = resource.get('url')
+    scheme = urlparse.urlsplit(url).scheme
+    if scheme not in ('http', 'https', 'ftp'):
+        raise util.JobError(
+            'Only http, https, and ftp resources may be fetched.'
+        )
+
     # fetch the resource data
-    logger.info('Fetching from: {0}'.format(resource.get('url')))
+    logger.info('Fetching from: {0}'.format(url))
+    headers = {}
+
+    # Removed authentication as we authenticate requests in cloudstorage extension
+    #if resource.get('url_type') == 'upload':
+    #    # If this is an uploaded file to CKAN, authenticate the request,
+    #    # otherwise we won't get file from private resources
+    #    headers['Authorization'] = api_key
     try:
-        request = urllib2.Request(resource.get('url'))
-
-        if request.get_type().lower() not in ('http', 'https', 'ftp'):
-            raise util.JobError(
-                'Only http, https, and ftp resources may be fetched.'
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=DOWNLOAD_TIMEOUT,
+            verify=SSL_VERIFY,
+            stream=True,  # just gets the headers for now
             )
+        response.raise_for_status()
 
-        # Removed authentication as we authenticate requests in cloudstorage extension
-        #if resource.get('url_type') == 'upload':
-            # If this is an uploaded file to CKAN, authenticate the request,
-            # otherwise we won't get file from private resources
-        #    request.add_header('Authorization', api_key)
+        cl = response.headers.get('content-length')
+        if cl and int(cl) > MAX_CONTENT_LENGTH:
+            raise util.JobError(
+                'Resource too large to download: {cl} > max ({max_cl}).'
+                .format(cl=cl, max_cl=MAX_CONTENT_LENGTH))
 
-        response = urllib2.urlopen(request, timeout=DOWNLOAD_TIMEOUT)
-    except urllib2.HTTPError as e:
+        tmp = tempfile.TemporaryFile()
+        length = 0
+        m = hashlib.md5()
+        for chunk in response.iter_content(CHUNK_SIZE):
+            length += len(chunk)
+            if length > MAX_CONTENT_LENGTH:
+                raise util.JobError(
+                    'Resource too large to process: {cl} > max ({max_cl}).'
+                    .format(cl=length, max_cl=MAX_CONTENT_LENGTH))
+            tmp.write(chunk)
+            m.update(chunk)
+
+        ct = response.headers.get('content-type', '').split(';', 1)[0]
+
+    except requests.HTTPError as e:
         raise HTTPError(
             "DataPusher received a bad HTTP response when trying to download "
-            "the data file", status_code=e.code,
-            request_url=resource.get('url'), response=e.read())
-    except urllib2.URLError as e:
-        if isinstance(e.reason, socket.timeout):
-            raise util.JobError('Connection timed out after %ss' %
-                                DOWNLOAD_TIMEOUT)
-        else:
-            raise HTTPError(
-                message=str(e.reason), status_code=None,
-                request_url=resource.get('url'), response=None)
-
-    cl = response.info().getheader('content-length')
-    if cl and int(cl) > MAX_CONTENT_LENGTH:
-        raise util.JobError(
-            'Resource too large to download: {cl} > max ({max_cl}).'.format(
-            cl=cl, max_cl=MAX_CONTENT_LENGTH))
-
-    tmp = tempfile.TemporaryFile()
-    length = 0
-    m = hashlib.md5()
-    while True:
-        chunk = response.read(CHUNK_SIZE)
-        if not chunk:
-            break
-        length += len(chunk) 
-        if length > MAX_CONTENT_LENGTH:
-            raise util.JobError(
-                'Resource too large to process: {cl} > max ({max_cl}).'.format(
-                cl=length, max_cl=MAX_CONTENT_LENGTH))
-        tmp.write(chunk)
-        m.update(chunk)
-
-    ct = response.info().getheader('content-type').split(';', 1)[0]
+            "the data file", status_code=e.response.status_code,
+            request_url=url, response=e.response.content)
+    except requests.RequestException as e:
+        raise HTTPError(
+            message=str(e), status_code=None,
+            request_url=url, response=None)
 
     file_hash = m.hexdigest()
     tmp.seek(0)
@@ -413,7 +415,9 @@ def push_to_datastore(task_id, input, dry_run=False):
         except:
             raise util.JobError(e)
 
-    row_set = table_set.tables.pop()
+    get_row_set = web.app.config.get('GET_ROW_SET',
+                                     lambda table_set: table_set.tables.pop())
+    row_set = get_row_set(table_set)
     offset, headers = messytables.headers_guess(row_set.sample)
 
     existing = datastore_resource_exists(resource_id, api_key, ckan_url)
